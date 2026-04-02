@@ -17,6 +17,7 @@ import asyncio
 import io
 import logging
 import os
+import time
 import uuid
 from typing import Dict, List, Optional, Tuple
 
@@ -52,7 +53,7 @@ log = logging.getLogger(__name__)
 SAMPLE_RATE       = 16000
 CHANNELS          = 1
 SILENCE_THRESHOLD = 0.01
-SILENCE_DURATION  = 1.5     # seconds of silence to stop recording
+SILENCE_DURATION  = 2    # seconds of silence to stop recording
 MAX_RECORD_SEC    = 30
 
 GREETING = (
@@ -93,8 +94,10 @@ def _beep():
     except Exception:
         pass
 
-def record_until_silence() -> np.ndarray:
+def record_until_silence() -> Tuple[np.ndarray, float]:
+    """Record audio until silence detected. Returns (audio, duration_sec)."""
     print("🎤 Listening...")
+    start_time = time.time()
     _beep()
     frames        = []
     silent        = 0
@@ -113,10 +116,13 @@ def record_until_silence() -> np.ndarray:
                 break
 
     audio = np.concatenate(frames, axis=0)
-    print(f"🎤 Recorded {len(audio)/SAMPLE_RATE:.1f}s")
-    return audio
+    duration = len(audio) / SAMPLE_RATE
+    print(f"🎤 Recorded {duration:.1f}s")
+    return audio, duration
 
-def transcribe(dg: DeepgramClient, audio: np.ndarray) -> str:
+def transcribe(dg: DeepgramClient, audio: np.ndarray) -> Tuple[str, float]:
+    """Transcribe audio using Deepgram STT. Returns (transcript, latency_sec)."""
+    start_time = time.time()
     buf = io.BytesIO()
     sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
     buf.seek(0)
@@ -129,11 +135,13 @@ def transcribe(dg: DeepgramClient, audio: np.ndarray) -> str:
             punctuate=True,
         )
         transcript = resp.results.channels[0].alternatives[0].transcript
+        latency = time.time() - start_time
         print(f"📝 You said: {transcript!r}")
-        return transcript.strip()
+        return transcript.strip(), latency
     except Exception as e:
+        latency = time.time() - start_time
         log.error(f"STT error: {e}")
-        return ""
+        return "", latency
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -145,8 +153,9 @@ def _embed_query(oai: AzureOpenAI, query: str) -> List[float]:
         model=AZURE_EMBEDDING_DEPLOYMENT_NAME, input=query)
     return resp.data[0].embedding
 
-def _search_pinecone(pc_index, vector: List[float]) -> List[Dict]:
-    """Search child chunks, then fetch parent content for each hit."""
+def _search_pinecone(pc_index, vector: List[float]) -> Tuple[List[Dict], float]:
+    """Search child chunks, then fetch parent content. Returns (chunks, latency_sec)."""
+    start_time = time.time()
     result = pc_index.query(
         vector=vector,
         top_k=TOP_K_CHILDREN,
@@ -187,8 +196,9 @@ def _search_pinecone(pc_index, vector: List[float]) -> List[Dict]:
             "score":          score,
         })
 
-    print(f"📚 Retrieved {len(chunks)} chunks | top score: {chunks[0]['score'] if chunks else 0}")
-    return chunks
+    latency = time.time() - start_time
+    print(f"📚 Retrieved {len(chunks)} chunks | top score: {chunks[0]['score'] if chunks else 0} | latency: {latency:.2f}s")
+    return chunks, latency
 
 def retrieve(
     r: redis.Redis,
@@ -196,29 +206,33 @@ def retrieve(
     pc_index,
     call_id: str,
     query: str,
-) -> Tuple[List[Dict], str]:
+) -> Tuple[List[Dict], str, float]:
     """
-    Returns (chunks, cache_source) where cache_source is one of:
+    Returns (chunks, cache_source, latency_sec) where cache_source is one of:
       "prefetch" | "semantic" | "pinecone"
     """
+    start_time = time.time()
 
     # 1. Prefetch cache (slow thinker pre-warmed)
     prefetched = prefetch_get(r, call_id, query)
     if prefetched:
-        print(f"⚡ Cache: PREFETCH HIT")
-        return prefetched, "prefetch"
+        latency = time.time() - start_time
+        print(f"⚡ Cache: PREFETCH HIT | latency: {latency:.3f}s")
+        return prefetched, "prefetch", latency
 
     # 2. Semantic cache (same query answered recently)
     cached = semantic_get(r, query)
     if cached:
-        print(f"⚡ Cache: SEMANTIC HIT")
-        return cached.get("chunks", []), "semantic"
+        latency = time.time() - start_time
+        print(f"⚡ Cache: SEMANTIC HIT | latency: {latency:.3f}s")
+        return cached.get("chunks", []), "semantic", latency
 
     # 3. Fresh Pinecone retrieval
     print(f"🔍 Cache: MISS → querying Pinecone")
     vector = _embed_query(oai, query)
-    chunks = _search_pinecone(pc_index, vector)
-    return chunks, "pinecone"
+    chunks, pc_latency = _search_pinecone(pc_index, vector)
+    latency = time.time() - start_time
+    return chunks, "pinecone", latency
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -230,9 +244,13 @@ def generate_answer(
     query: str,
     chunks: List[Dict],
     history: List[Dict],
-) -> str:
+) -> Tuple[str, float]:
+    """Generate answer from LLM. Returns (answer, latency_sec)."""
+    start_time = time.time()
+    
     if not chunks:
-        return "I'm sorry, I couldn't find relevant information to answer that."
+        latency = time.time() - start_time
+        return "I'm sorry, I couldn't find relevant information to answer that.", latency
 
     # Use parent_content when available (full page context), else child content
     context_parts = []
@@ -244,7 +262,7 @@ def generate_answer(
     context = "\n\n---\n\n".join(context_parts)
 
     system = (
-        "You are a helpful voice assistant for an AI service provider. "
+        "You are a helpful voice assistant for an AI service provider named 'Dyyota'. "
         "Answer the user's question based only on the provided documentation. "
         "Be concise — your answer will be spoken aloud, so keep it to 2-3 sentences max. "
         "Use plain conversational English. No markdown, no bullet points, no code blocks. "
@@ -270,18 +288,22 @@ def generate_answer(
             max_tokens=180,
         )
         answer = resp.choices[0].message.content.strip()
+        latency = time.time() - start_time
         print(f"💬 Answer: {answer}")
-        return answer
+        return answer, latency
     except Exception as e:
+        latency = time.time() - start_time
         log.error(f"Generation error: {e}")
-        return "I encountered an error. Please try again."
+        return "I encountered an error. Please try again.", latency
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def speak(dg: DeepgramClient, text: str):
+def speak(dg: DeepgramClient, text: str) -> float:
+    """Speak text using Deepgram TTS. Returns latency_sec."""
+    start_time = time.time()
     print("🔊 Speaking...")
     try:
         audio_stream = dg.speak.v1.audio.generate(
@@ -299,9 +321,13 @@ def speak(dg: DeepgramClient, text: str):
         data, sr = sf.read("_tts.mp3")
         sd.play(data, sr)
         sd.wait()
+        latency = time.time() - start_time
+        return latency
     except Exception as e:
+        latency = time.time() - start_time
         log.error(f"TTS error: {e}")
         print(f"[TTS fallback] {text}")
+        return latency
     finally:
         try:
             os.remove("_tts.mp3")
@@ -344,38 +370,41 @@ def run_agent():
     print(f"📞 Call ID: {call_id}")
 
     # ── Greet ─────────────────────────────────────────────────────────────────
-    speak(dg, GREETING)
+    _ = speak(dg, GREETING)
 
     # ── Conversation loop ─────────────────────────────────────────────────────
     turn = 0
     while True:
         turn += 1
+        turn_start = time.time()
         print(f"\n{'─'*40}  Turn {turn}")
 
         try:
             # 1. Record + transcribe
-            audio      = record_until_silence()
-            query      = transcribe(dg, audio)
+            audio, record_latency = record_until_silence()
+            query, stt_latency = transcribe(dg, audio)
+            print(f"  ⏱️  Record: {record_latency:.2f}s | STT: {stt_latency:.2f}s")
 
             if not query:
-                speak(dg, "I didn't catch that. Could you please repeat?")
+                _ = speak(dg, "I didn't catch that. Could you please repeat?")
                 continue
 
             # 2. Exit check
             if any(e in query.lower() for e in EXIT_PHRASES):
                 prefetch_clear_call(r, call_id)
-                speak(dg, "Goodbye! Have a great day.")
+                _ = speak(dg, "Goodbye! Have a great day.")
                 print("\n👋 Exiting.")
                 break
 
             # 3. Retrieve (prefetch → semantic → Pinecone)
-            chunks, cache_source = retrieve(r, oai, pc_index, call_id, query)
+            chunks, cache_source, retrieval_latency = retrieve(r, oai, pc_index, call_id, query)
 
             # 4. Get conversation history for context
             history = session_get_history(r, call_id)
 
             # 5. Generate answer
-            answer = generate_answer(oai, query, chunks, history)
+            answer, gen_latency = generate_answer(oai, query, chunks, history)
+            print(f"  ⏱️  Retrieval: {retrieval_latency:.2f}s | Generation: {gen_latency:.2f}s")
 
             # 6. Cache result in semantic cache (only for fresh Pinecone hits)
             if cache_source == "pinecone" and chunks:
@@ -387,9 +416,14 @@ def run_agent():
             session_save_chunks(r, call_id, chunks)
 
             # 8. Speak answer
-            speak(dg, answer)
+            tts_latency = speak(dg, answer)
+            print(f"  ⏱️  TTS: {tts_latency:.2f}s")
 
-            # 9. Fire slow thinker in background (non-blocking)
+            # 9. Total turn time (user spoke → agent spoke)
+            total_turn_time = time.time() - turn_start
+            print(f"  ⏱️  Total Turn Time: {total_turn_time:.2f}s")
+
+            # 10. Fire slow thinker in background (non-blocking)
             asyncio.get_event_loop().run_until_complete(
                 asyncio.ensure_future(
                     run_slow_thinker(r, call_id, query, answer)
@@ -403,7 +437,7 @@ def run_agent():
         except Exception as e:
             log.error(f"Turn error: {e}")
             try:
-                speak(dg, "I encountered an error. Please try again.")
+                _ = speak(dg, "I encountered an error. Please try again.")
             except Exception:
                 pass
 
