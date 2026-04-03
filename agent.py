@@ -97,7 +97,9 @@ SYSTEM_PROMPT = (
     "industries, technology, or any factual question, you MUST call the "
     "rag_retrieve function first to get accurate information. "
     "Do NOT answer from memory — always call rag_retrieve for factual questions. "
-    "Keep answers to 2-3 short sentences spoken aloud. "
+    "IMPORTANT: Respond in exactly ONE or TWO flowing sentences maximum. "
+    "Never use three separate sentences. Combine information into a single "
+    "natural spoken response. Keep it concise and conversational. "
     "Use plain conversational English. No markdown, no bullet points."
 )
 
@@ -324,6 +326,89 @@ def run_agent():
     )
     speaker.start()
 
+    # ── Helper: send FunctionCallResponse via raw JSON ───────────────────────
+    def _send_function_response(conn, fn_id, fn_name, content):
+        """
+        Send a FunctionCallResponse matching the Deepgram wire format:
+          { "type": "FunctionCallResponse", "id": "...", "name": "...", "content": "..." }
+
+        Strategy:
+          1. Try the typed SDK object (AgentV1SendFunctionCallResponse)
+          2. Fallback: send raw JSON via the internal _websocket
+        """
+        from deepgram.agent.v1.types.agent_v1send_function_call_response import (
+            AgentV1SendFunctionCallResponse,
+        )
+
+        # ── Attempt 1: use the typed SDK object ───────────────────────────
+        try:
+            resp_obj = AgentV1SendFunctionCallResponse(
+                type="FunctionCallResponse",
+                id=fn_id,
+                name=fn_name,
+                content=content,
+            )
+            conn.send_function_call_response(resp_obj)
+            return
+        except TypeError:
+            # Wrong call signature — fall through
+            pass
+        except Exception as e:
+            log.warning(f"[Agent] Typed send failed ({e}), trying raw WS...")
+
+        # ── Attempt 2: raw JSON over the internal websocket ───────────────
+        payload = json.dumps({
+            "type": "FunctionCallResponse",
+            "id":   fn_id,
+            "name": fn_name,
+            "content": content,
+        })
+        try:
+            conn._websocket.send(payload)
+        except Exception as e:
+            log.error(f"[Agent] Failed to send FunctionCallResponse: {e}")
+
+    # ── Helper: process a single function call ─────────────────────────────────
+    def _handle_function_call(fn_name, fn_id, fn_input):
+        """Execute a single function call and send the response back."""
+        if fn_name == "rag_retrieve":
+            query = fn_input.get("query", state["last_user_query"])
+            print(f"🔍  RAG lookup: \"{query}\"")
+            t_start = time.time()
+
+            context, cache_source, embed_sec, cache_sec, pinecone_sec = \
+                rag_retrieve(oai, pc_index, cache, query)
+
+            retrieval_sec = embed_sec + cache_sec + pinecone_sec
+            cache_label   = "FAISS" if cache_source == "cache" else "Pinecone"
+            cache_detail  = (
+                f"FAISS {cache_sec*1000:.0f}ms"
+                if cache_source == "cache"
+                else f"Pinecone {pinecone_sec:.2f}s"
+            )
+            print(f"    Embed: {embed_sec:.2f}s  |  "
+                  f"Cache: {cache_sec*1000:.1f}ms → {cache_detail}  |  "
+                  f"Total: {retrieval_sec:.2f}s")
+
+            turn_latencies.append({
+                "turn":          state["turn"],
+                "embed_sec":     round(embed_sec, 3),
+                "cache_sec":     round(cache_sec, 3),
+                "pinecone_sec":  round(pinecone_sec, 2),
+                "cache":         cache_label,
+                "retrieval_sec": round(retrieval_sec, 2),
+            })
+
+            # Send result back to Deepgram using raw JSON
+            # The wire format requires: type, id, name, content
+            # (the SDK method's kwargs don't match, so we send raw)
+            _send_function_response(connection, fn_id, fn_name, context)
+            log.info(f"[RAG] Done in {time.time()-t_start:.2f}s ({cache_label})")
+        else:
+            # Unknown function — send empty response so agent doesn't hang
+            log.warning(f"[Agent] Unknown function: {fn_name}")
+            _send_function_response(connection, fn_id, fn_name, "Function not found.")
+
     # ── Message handler ────────────────────────────────────────────────────────
     def on_message(message):
         nonlocal turn, turn_latencies
@@ -372,51 +457,62 @@ def run_agent():
                     )
 
         elif msg_type == "FunctionCallRequest":
-            fn_name  = getattr(message, "function_name", "")
-            fn_id    = getattr(message, "function_call_id", "")
-            fn_input = getattr(message, "input", {})
+            # ─── FIX: The SDK sends a `functions` list, not flat attributes ───
+            # Raw event looks like:
+            #   {'type': 'FunctionCallRequest',
+            #    'functions': [{'id': 'call_...', 'name': 'rag_retrieve',
+            #                   'arguments': '{"query": "..."}'}]}
+            #
+            # Try the list-based format first, fall back to flat attributes.
 
-            # input may be a string or dict depending on SDK version
-            if isinstance(fn_input, str):
-                try:
-                    fn_input = json.loads(fn_input)
-                except Exception:
-                    fn_input = {}
+            functions = getattr(message, "functions", None)
 
-            if fn_name == "rag_retrieve":
-                query = fn_input.get("query", state["last_user_query"])
-                print(f"🔍  RAG lookup: \"{query}\"")
-                t_start = time.time()
+            if functions and len(functions) > 0:
+                # ── List-based format (what the SDK actually sends) ────────
+                for fn in functions:
+                    # Support both dict and object-style access
+                    if isinstance(fn, dict):
+                        fn_name = fn.get("name", "")
+                        fn_id   = fn.get("id", "")
+                        fn_args = fn.get("arguments", "{}")
+                    else:
+                        fn_name = getattr(fn, "name", "")
+                        fn_id   = getattr(fn, "id", "")
+                        fn_args = getattr(fn, "arguments", "{}")
 
-                context, cache_source, embed_sec, cache_sec, pinecone_sec = \
-                    rag_retrieve(oai, pc_index, cache, query)
+                    # Parse arguments string → dict
+                    if isinstance(fn_args, str):
+                        try:
+                            fn_input = json.loads(fn_args)
+                        except Exception:
+                            fn_input = {}
+                    elif isinstance(fn_args, dict):
+                        fn_input = fn_args
+                    else:
+                        fn_input = {}
 
-                retrieval_sec = embed_sec + cache_sec + pinecone_sec
-                cache_label   = "FAISS" if cache_source == "cache" else "Pinecone"
-                cache_detail  = (
-                    f"FAISS {cache_sec*1000:.0f}ms"
-                    if cache_source == "cache"
-                    else f"Pinecone {pinecone_sec:.2f}s"
-                )
-                print(f"    Embed: {embed_sec:.2f}s  |  "
-                      f"Cache: {cache_sec*1000:.1f}ms → {cache_detail}  |  "
-                      f"Total: {retrieval_sec:.2f}s")
+                    _handle_function_call(fn_name, fn_id, fn_input)
+            else:
+                # ── Flat-attribute fallback (older SDK versions) ───────────
+                fn_name  = getattr(message, "function_name", "")
+                fn_id    = getattr(message, "function_call_id", "")
+                fn_input = getattr(message, "input", {})
 
-                turn_latencies.append({
-                    "turn":          state["turn"],
-                    "embed_sec":     round(embed_sec, 3),
-                    "cache_sec":     round(cache_sec, 3),
-                    "pinecone_sec":  round(pinecone_sec, 2),
-                    "cache":         cache_label,
-                    "retrieval_sec": round(retrieval_sec, 2),
-                })
+                if isinstance(fn_input, str):
+                    try:
+                        fn_input = json.loads(fn_input)
+                    except Exception:
+                        fn_input = {}
 
-                # Send result back to Deepgram
-                connection.send_function_call_response(
-                    function_call_id=fn_id,
-                    output=context,
-                )
-                log.info(f"[RAG] Done in {time.time()-t_start:.2f}s ({cache_label})")
+                if fn_name:
+                    _handle_function_call(fn_name, fn_id, fn_input)
+                else:
+                    # Neither format matched — log for debugging
+                    log.error(
+                        f"[Agent] FunctionCallRequest received but could not "
+                        f"extract function name. Raw message attrs: "
+                        f"{[a for a in dir(message) if not a.startswith('_')]}"
+                    )
 
         elif msg_type == "AgentStartedSpeaking":
             print("🔊  Speaking...")
@@ -440,7 +536,7 @@ def run_agent():
     print(f"✅ Connecting to Deepgram Voice Agent...")
 
     dg_client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
-    
+
     # Use context manager to handle connection lifecycle
     with dg_client.agent.v1.connect() as connection:
         connection.on(EventType.MESSAGE, on_message)
@@ -460,7 +556,7 @@ def run_agent():
         # Wait for connection to establish
         time.sleep(1)
 
-        # ── Stream mic audio continuously ─────────────────────────────────────────
+        # ── Stream mic audio continuously ─────────────────────────────────────
         print("🎤  Streaming mic... (speak to talk, say 'goodbye' to exit)\n")
         try:
             with sd.InputStream(
