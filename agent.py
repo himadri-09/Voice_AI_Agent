@@ -1,16 +1,34 @@
 """
-agent.py — Voice AI agent: STT → SemanticCache (FAISS) → Pinecone → LLM → TTS.
+agent.py — Voice RAG Agent using Deepgram Voice Agent SDK.
 
-Changes in this version:
-  1. Slow thinker guard — skipped if query < 3 words (noise/empty turns)
-  2. Clean per-turn log showing the metric that matters:
-       Query→Answer = retrieval + generation (what user feels as agent delay)
-  3. Suppressed noisy INFO logs from Azure HTTP / SemanticCache internals
-     — only WARNINGS and above from third-party libraries are shown
+Rewritten to use deepgram-sdk exactly as shown in official docs:
+  https://developers.deepgram.com/docs/voice-agent
+
+KEY CHANGES FROM PREVIOUS VERSION:
+  - Uses DeepgramClient + client.agent.v1.connect() instead of raw websockets
+  - Settings sent via connection.send_settings() with typed SDK objects
+  - Audio streamed via connection.send_media()
+  - Events handled via connection.on(EventType.MESSAGE, handler)
+  - OpenAI API key read from OPENAI_API_KEY env var automatically by SDK
+  - Sample rate 24000 (matches Deepgram docs)
+  - Output container "wav" (matches Deepgram docs)
+
+RAG INTEGRATION:
+  FunctionCallRequest → run FAISS + Pinecone → send FunctionCallResponse
+  This is the hook that injects your knowledge base into the conversation.
+
+ECHO:
+  Handled by Deepgram internally — no need for agent_speaking flags.
+  Use headphones for best results on MacBook.
+
+INSTALL:
+  pip install deepgram-sdk sounddevice numpy
 """
 
-import asyncio
+import json
 import logging
+import os
+import threading
 import time
 import uuid
 from typing import Dict, List, Tuple
@@ -19,13 +37,31 @@ import numpy as np
 import sounddevice as sd
 from openai import AzureOpenAI
 from pinecone import Pinecone
-from stt import transcribe
-from tts import speak
+
+from deepgram import DeepgramClient, ThinkSettingsV1, SpeakSettingsV1
+from deepgram.core.events import EventType
+from deepgram.agent.v1.types import (
+    AgentV1Settings,
+    AgentV1SettingsAgent,
+    AgentV1SettingsAudio,
+    AgentV1SettingsAudioInput,
+    AgentV1SettingsAudioOutput,
+    AgentV1SettingsAgentListen,
+    AgentV1SettingsAgentThinkOneItem,
+    AgentV1SettingsAgentSpeakOneItem,
+)
+from deepgram.agent.v1.types.agent_v1settings_agent_listen_provider import (
+    AgentV1SettingsAgentListenProvider_V1,
+)
+from deepgram.agent.v1.types.agent_v1settings_agent_speak_one_item_provider import (
+    AgentV1SettingsAgentSpeakOneItemProvider_Deepgram,
+)
 
 from config import (
     AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT,
     AZURE_API_VERSION, AZURE_DEPLOYMENT_NAME,
     AZURE_EMBEDDING_DEPLOYMENT_NAME,
+    DEEPGRAM_API_KEY, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_MODEL,
     PINECONE_API_KEY, PINECONE_INDEX_NAME,
     TOP_K_CHILDREN,
 )
@@ -36,32 +72,41 @@ from redis_client import (
 )
 from semantic_cache import SemanticCache
 from slow_thinker import run_slow_thinker
+import asyncio
 
-# ── Logging: suppress noisy HTTP / cache internals, keep our prints clean ─────
+# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)   # our own logger stays verbose
-# Silence Azure SDK and httpx HTTP request lines
+log.setLevel(logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("pinecone").setLevel(logging.WARNING)
 
-# ── Audio settings ─────────────────────────────────────────────────────────────
-SAMPLE_RATE       = 16000
-CHANNELS          = 1
-SILENCE_THRESHOLD = 0.01
-SILENCE_DURATION  = 2
-MAX_RECORD_SEC    = 30
+# ── Audio ──────────────────────────────────────────────────────────────────────
+SAMPLE_RATE      = 24000   # Deepgram Voice Agent works at 24kHz
+CHANNELS         = 1
+CHUNK_MS         = 100
+CHUNK_FRAMES     = int(SAMPLE_RATE * CHUNK_MS / 1000)
 
-EMBEDDING_DIM = 1536   # text-embedding-ada-002 / text-embedding-3-small
+EMBEDDING_DIM    = 1536
+MIN_QUERY_WORDS  = 3
+
+SYSTEM_PROMPT = (
+    "You are a helpful voice assistant for Dyyota, an AI solutions company. "
+    "When a user asks ANYTHING about Dyyota's services, pricing, integrations, "
+    "industries, technology, or any factual question, you MUST call the "
+    "rag_retrieve function first to get accurate information. "
+    "Do NOT answer from memory — always call rag_retrieve for factual questions. "
+    "Keep answers to 2-3 short sentences spoken aloud. "
+    "Use plain conversational English. No markdown, no bullet points."
+)
 
 GREETING = (
-    "Hello! I'm your AI assistant. I'm ready to answer your questions about Dyyota "
-    "and our services. Just speak after the beep and I'll help you."
+    "Hello! I'm your Dyyota AI assistant. "
+    "Just start talking and I'll answer your questions."
 )
-EXIT_PHRASES = {"exit", "quit", "bye", "goodbye", "stop", "that's all", "end call"}
-MIN_QUERY_WORDS = 3   # below this — skip slow thinker, it's noise
+
+EXIT_PHRASES = {"exit", "quit", "bye", "goodbye", "stop", "end call"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -80,45 +125,7 @@ def _pc_index():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# AUDIO
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _beep():
-    try:
-        t    = np.linspace(0, 0.15, int(SAMPLE_RATE * 0.15), False)
-        tone = (0.3 * np.sin(2 * np.pi * 880 * t)).astype(np.float32)
-        sd.play(tone, SAMPLE_RATE)
-        sd.wait()
-    except Exception:
-        pass
-
-def record_until_silence() -> Tuple[np.ndarray, float]:
-    print("🎤 Listening...")
-    start_time = time.time()
-    _beep()
-    frames      = []
-    silent      = 0
-    chunk_size  = int(SAMPLE_RATE * 0.1)
-    need_silent = int(SILENCE_DURATION / 0.1)
-    max_chunks  = int(MAX_RECORD_SEC / 0.1)
-
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
-                        dtype="float32", blocksize=chunk_size) as stream:
-        for _ in range(max_chunks):
-            chunk, _ = stream.read(chunk_size)
-            frames.append(chunk.copy())
-            rms = float(np.sqrt(np.mean(chunk ** 2)))
-            silent = silent + 1 if rms < SILENCE_THRESHOLD else 0
-            if silent >= need_silent and len(frames) > 10:
-                break
-
-    audio    = np.concatenate(frames, axis=0)
-    duration = len(audio) / SAMPLE_RATE
-    return audio, duration
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# RETRIEVAL
+# RAG PIPELINE
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _embed_query(oai: AzureOpenAI, query: str) -> np.ndarray:
@@ -129,23 +136,19 @@ def _embed_query(oai: AzureOpenAI, query: str) -> np.ndarray:
     return np.array(resp.data[0].embedding, dtype=np.float32)
 
 
-def _search_pinecone(pc_index, vector: np.ndarray) -> Tuple[List[Dict], float]:
-    start = time.time()
+def _search_pinecone(pc_index, vector: np.ndarray) -> List[Dict]:
     result = pc_index.query(
         vector=vector.tolist(),
         top_k=TOP_K_CHILDREN,
         include_metadata=True,
         filter={"type": {"$eq": "child"}},
     )
-
     chunks = []
     fetched_parents: Dict[str, str] = {}
-
     for match in result.get("matches", []):
         meta      = match.get("metadata", {})
         parent_id = meta.get("parent_id", "")
         score     = round(match.get("score", 0), 3)
-
         parent_content = ""
         if parent_id:
             if parent_id not in fetched_parents:
@@ -156,100 +159,62 @@ def _search_pinecone(pc_index, vector: np.ndarray) -> Tuple[List[Dict], float]:
                 except Exception:
                     fetched_parents[parent_id] = ""
             parent_content = fetched_parents[parent_id]
-
         chunks.append({
             "content":        meta.get("content", ""),
             "parent_content": parent_content,
             "url":            meta.get("url", ""),
             "title":          meta.get("title", ""),
-            "section_title":  meta.get("section_title", ""),
             "heading_path":   meta.get("heading_path", ""),
             "score":          score,
         })
+    return chunks
 
-    return chunks, time.time() - start
 
-
-def retrieve(
+def rag_retrieve(
     oai: AzureOpenAI,
     pc_index,
     cache: SemanticCache,
     query: str,
-) -> Tuple[List[Dict], str, float]:
-    start = time.time()
+) -> Tuple[str, str, float, float, float]:
+    t0        = time.time()
     query_vec = _embed_query(oai, query)
+    embed_sec = time.time() - t0
 
-    # 1. FAISS semantic cache
-    cached_chunks = cache.get(query_vec)
-    if cached_chunks:
-        latency = time.time() - start
-        return cached_chunks, "cache", latency
+    t1        = time.time()
+    cached    = cache.get(query_vec)
+    cache_sec = time.time() - t1
 
-    # 2. Pinecone
-    chunks, _ = _search_pinecone(pc_index, query_vec)
+    if cached:
+        return _chunks_to_context(cached), "cache", embed_sec, cache_sec, 0.0
+
+    t2           = time.time()
+    chunks       = _search_pinecone(pc_index, query_vec)
+    pinecone_sec = time.time() - t2
+
     if chunks:
         cache.put(doc_embedding=query_vec, chunks=chunks, relevance_score=chunks[0]["score"])
 
-    return chunks, "pinecone", time.time() - start
+    return _chunks_to_context(chunks), "pinecone", embed_sec, cache_sec, pinecone_sec
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# GENERATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-def generate_answer(
-    oai: AzureOpenAI,
-    query: str,
-    chunks: List[Dict],
-    history: List[Dict],
-) -> Tuple[str, float]:
-    start = time.time()
-
+def _chunks_to_context(chunks: List[Dict]) -> str:
     if not chunks:
-        return "I'm sorry, I couldn't find relevant information to answer that.", 0.0
-
-    context_parts = []
-    for i, c in enumerate(chunks):
-        body = c.get("parent_content") or c.get("content", "")
-        context_parts.append(f"[{i+1}] {c['heading_path'] or c['title']}\n{body[:3000]}")
-    context = "\n\n---\n\n".join(context_parts)
-
-    system = (
-        "You are a helpful voice assistant for Dyyota. "
-        "Answer in 2-3 short sentences max — your answer will be spoken aloud. "
-        "Use plain conversational English. No markdown, no bullet points, no code blocks. "
-        "If the documentation doesn't contain the answer, say so briefly."
-    )
-
-    messages = [{"role": "system", "content": system}]
-    if history:
-        messages.extend(history[-6:])
-    messages.append({
-        "role": "user",
-        "content": f"Documentation:\n{context}\n\nQuestion: {query}",
-    })
-
-    try:
-        resp   = oai.chat.completions.create(
-            model=AZURE_DEPLOYMENT_NAME,
-            messages=messages,
-            temperature=0.3,
-            max_tokens=180,
-        )
-        answer = resp.choices[0].message.content.strip()
-        return answer, time.time() - start
-    except Exception as e:
-        log.error(f"Generation error: {e}")
-        return "I encountered an error. Please try again.", time.time() - start
+        return "No relevant information found in the knowledge base."
+    parts = []
+    for i, c in enumerate(chunks[:5]):
+        body  = c.get("parent_content") or c.get("content", "")
+        title = c.get("heading_path") or c.get("title", "")
+        parts.append(f"[{i+1}] {title}\n{body[:2000]}")
+    return "\n\n---\n\n".join(parts)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MAIN LOOP
+# MAIN AGENT
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def run_agent():
+def run_agent():
     print("\n" + "=" * 55)
-    print("🎙️  VOICE RAG AGENT")
+    print("🎙️  VOICE RAG AGENT  (Deepgram Voice Agent + RAG)")
     print("=" * 55)
 
     oai      = _oai()
@@ -273,93 +238,274 @@ async def run_agent():
     )
 
     print(f"✅ Pinecone ready — {stats['total_vector_count']} vectors")
-    print(f"✅ SemanticCache ready\n")
+    print(f"✅ SemanticCache (FAISS) ready")
 
-    call_id = str(uuid.uuid4())[:8]
-    print(f"📞 Call ID: {call_id}\n")
+    call_id        = str(uuid.uuid4())[:8]
+    turn           = 0
+    turn_latencies = []
 
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, speak, GREETING)
+    # Shared state accessed from the message handler thread
+    state = {
+        "last_user_query":   "",
+        "last_agent_answer": "",
+        "turn":              0,
+    }
 
-    turn = 0
-    while True:
-        turn += 1
-        print(f"\n{'─' * 48}  Turn {turn}")
+    # ── Build settings using SDK typed objects (exactly as per docs) ───────────
+    settings = AgentV1Settings(
+        type="Settings",
+        audio=AgentV1SettingsAudio(
+            input=AgentV1SettingsAudioInput(
+                encoding="linear16",
+                sample_rate=SAMPLE_RATE,
+            ),
+            output=AgentV1SettingsAudioOutput(
+                encoding="linear16",
+                sample_rate=SAMPLE_RATE,
+                container="wav",
+            ),
+        ),
+        agent=AgentV1SettingsAgent(
+            language="en",
+            listen=AgentV1SettingsAgentListen(
+                provider=AgentV1SettingsAgentListenProvider_V1(
+                    version="v1",
+                    type="deepgram",
+                    model=DEEPGRAM_STT_MODEL,   # nova-2
+                )
+            ),
+            think=[
+                AgentV1SettingsAgentThinkOneItem(
+                    provider={
+                        "type": "open_ai",
+                        "model": "gpt-4o-mini",
+                        # SDK reads OPENAI_API_KEY from environment automatically
+                    },
+                    prompt=SYSTEM_PROMPT,
+                    functions=[
+                        {
+                            "name": "rag_retrieve",
+                            "description": (
+                                "Retrieve relevant information from the Dyyota knowledge base. "
+                                "ALWAYS call this for any question about Dyyota services, "
+                                "pricing, integrations, industries, or any factual question."
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {
+                                        "type":        "string",
+                                        "description": "The user's question",
+                                    }
+                                },
+                                "required": ["query"],
+                            },
+                        }
+                    ],
+                )
+            ],
+            speak=[
+                AgentV1SettingsAgentSpeakOneItem(
+                    provider={
+                        "type": "deepgram",
+                        "model": DEEPGRAM_TTS_MODEL,   # aura-asteria-en
+                    }
+                )
+            ],
+            greeting=GREETING,
+        ),
+    )
 
-        try:
-            # ── 1. Record ─────────────────────────────────────────────────────
-            audio, record_sec = await loop.run_in_executor(None, record_until_silence)
+    # ── Speaker output stream ──────────────────────────────────────────────────
+    speaker = sd.RawOutputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        dtype="int16",
+    )
+    speaker.start()
 
-            # ── 2. STT ────────────────────────────────────────────────────────
-            query, stt_sec = await loop.run_in_executor(None, transcribe, audio)
+    # ── Message handler ────────────────────────────────────────────────────────
+    def on_message(message):
+        nonlocal turn, turn_latencies
 
-            # STT done = user's turn is over, agent processing starts now
-            agent_start = time.time()
+        # Binary audio from Deepgram TTS → play immediately
+        if isinstance(message, bytes):
+            speaker.write(message)
+            return
 
-            print(f"🎤  You said: \"{query}\"")
-            print(f"    Record {record_sec:.1f}s  |  STT {stt_sec:.2f}s")
+        msg_type = getattr(message, "type", None)
+        if msg_type is None:
+            return
 
-            if not query.strip():
-                await loop.run_in_executor(None, speak, "I didn't catch that. Could you repeat?")
-                continue
+        if msg_type == "SettingsApplied":
+            print(f"\n✅ Deepgram Voice Agent ready — start talking!\n")
+            print(f"📞 Call ID: {call_id}")
+            print("🎤  Mic is always on — just start talking\n")
 
-            if any(e in query.lower() for e in EXIT_PHRASES):
-                cache.clear()
-                await loop.run_in_executor(None, speak, "Goodbye! Have a great day.")
-                print("\n👋 Exiting.")
-                break
+        elif msg_type == "ConversationText":
+            role    = getattr(message, "role", "")
+            content = getattr(message, "content", "").strip()
+            if not content:
+                return
 
-            # ── 3. Retrieve ───────────────────────────────────────────────────
-            chunks, cache_source, retrieval_sec = await loop.run_in_executor(
-                None, retrieve, oai, pc_index, cache, query
-            )
-            cache_label = f"FAISS hit" if cache_source == "cache" else "Pinecone"
+            if role == "user":
+                state["last_user_query"] = content
+                state["turn"] += 1
+                print(f"\n{'─'*48}  Turn {state['turn']}")
+                print(f"🎤  You said: \"{content}\"")
 
-            # ── 4. Generate ───────────────────────────────────────────────────
-            history          = session_get_history(r, call_id)
-            answer, gen_sec  = await loop.run_in_executor(
-                None, generate_answer, oai, query, chunks, history
-            )
+                if any(e in content.lower() for e in EXIT_PHRASES):
+                    print("\n👋 Exiting.")
+                    _print_latency_summary(turn_latencies)
+                    os._exit(0)
 
-            # This is the moment the agent has the answer — before TTS API call
-            query_to_answer_sec = time.time() - agent_start
+            elif role == "assistant":
+                state["last_agent_answer"] = content
+                print(f"💬  \"{content}\"")
+                session_add_turn(r, call_id, "user", state["last_user_query"])
+                session_add_turn(r, call_id, "assistant", content)
 
-            print(f"💬  \"{answer}\"")
-            print(f"    Retrieval {retrieval_sec:.2f}s ({cache_label})  |  "
-                  f"LLM {gen_sec:.2f}s")
-            print(f"    ⚡ Query→Answer: {query_to_answer_sec:.2f}s  "
-                  f"← time from your last word to agent having the answer")
+                if (state["last_user_query"] and
+                        len(state["last_user_query"].split()) >= MIN_QUERY_WORDS):
+                    asyncio.run(
+                        run_slow_thinker(cache, state["last_user_query"], content)
+                    )
 
-            # ── 5. Save session ───────────────────────────────────────────────
-            session_add_turn(r, call_id, "user", query)
-            session_add_turn(r, call_id, "assistant", answer)
-            session_save_chunks(r, call_id, chunks)
+        elif msg_type == "FunctionCallRequest":
+            fn_name  = getattr(message, "function_name", "")
+            fn_id    = getattr(message, "function_call_id", "")
+            fn_input = getattr(message, "input", {})
 
-            # ── 6. Speak ──────────────────────────────────────────────────────
+            # input may be a string or dict depending on SDK version
+            if isinstance(fn_input, str):
+                try:
+                    fn_input = json.loads(fn_input)
+                except Exception:
+                    fn_input = {}
+
+            if fn_name == "rag_retrieve":
+                query = fn_input.get("query", state["last_user_query"])
+                print(f"🔍  RAG lookup: \"{query}\"")
+                t_start = time.time()
+
+                context, cache_source, embed_sec, cache_sec, pinecone_sec = \
+                    rag_retrieve(oai, pc_index, cache, query)
+
+                retrieval_sec = embed_sec + cache_sec + pinecone_sec
+                cache_label   = "FAISS" if cache_source == "cache" else "Pinecone"
+                cache_detail  = (
+                    f"FAISS {cache_sec*1000:.0f}ms"
+                    if cache_source == "cache"
+                    else f"Pinecone {pinecone_sec:.2f}s"
+                )
+                print(f"    Embed: {embed_sec:.2f}s  |  "
+                      f"Cache: {cache_sec*1000:.1f}ms → {cache_detail}  |  "
+                      f"Total: {retrieval_sec:.2f}s")
+
+                turn_latencies.append({
+                    "turn":          state["turn"],
+                    "embed_sec":     round(embed_sec, 3),
+                    "cache_sec":     round(cache_sec, 3),
+                    "pinecone_sec":  round(pinecone_sec, 2),
+                    "cache":         cache_label,
+                    "retrieval_sec": round(retrieval_sec, 2),
+                })
+
+                # Send result back to Deepgram
+                connection.send_function_call_response(
+                    function_call_id=fn_id,
+                    output=context,
+                )
+                log.info(f"[RAG] Done in {time.time()-t_start:.2f}s ({cache_label})")
+
+        elif msg_type == "AgentStartedSpeaking":
             print("🔊  Speaking...")
-            tts_sec = await loop.run_in_executor(None, speak, answer)
-            print(f"    TTS {tts_sec:.2f}s  (audio playback included)")
 
-            # ── 7. Summary ────────────────────────────────────────────────────
-            print(f"    Cache entries: {cache.size}")
+        elif msg_type == "UserStartedSpeaking":
+            log.info("[Agent] User started speaking")
 
-            # ── 8. Slow thinker — fire only for real queries ──────────────────
-            if len(query.split()) >= MIN_QUERY_WORDS:
-                asyncio.create_task(run_slow_thinker(cache, query, answer))
-            else:
-                log.info(f"[SlowThinker] Skipped — query too short: '{query}'")
+        elif msg_type == "Error":
+            log.error(f"[Deepgram] Error: {message}")
 
+    def on_error(error):
+        log.error(f"[Deepgram] WebSocket error: {error}")
+
+    def on_close(event):
+        log.info("[Deepgram] Connection closed")
+        speaker.stop()
+        speaker.close()
+        _print_latency_summary(turn_latencies)
+
+    # ── Connect using SDK ──────────────────────────────────────────────────────
+    print(f"✅ Connecting to Deepgram Voice Agent...")
+
+    dg_client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
+    
+    # Use context manager to handle connection lifecycle
+    with dg_client.agent.v1.connect() as connection:
+        connection.on(EventType.MESSAGE, on_message)
+        connection.on(EventType.ERROR,   on_error)
+        connection.on(EventType.CLOSE,   on_close)
+
+        # Send settings
+        connection.send_settings(settings)
+
+        # Start listening for events in background thread
+        listener_thread = threading.Thread(
+            target=connection.start_listening,
+            daemon=True,
+        )
+        listener_thread.start()
+
+        # Wait for connection to establish
+        time.sleep(1)
+
+        # ── Stream mic audio continuously ─────────────────────────────────────────
+        print("🎤  Streaming mic... (speak to talk, say 'goodbye' to exit)\n")
+        try:
+            with sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_FRAMES,
+            ) as mic:
+                while True:
+                    chunk, _ = mic.read(CHUNK_FRAMES)
+                    pcm = chunk.astype(np.int16).tobytes()
+                    connection.send_media(pcm)
         except KeyboardInterrupt:
-            cache.clear()
             print("\n\n👋 Interrupted.")
-            break
-        except Exception as e:
-            log.error(f"Turn error: {e}", exc_info=True)
-            try:
-                await loop.run_in_executor(None, speak, "I encountered an error. Please try again.")
-            except Exception:
-                pass
+            _print_latency_summary(turn_latencies)
+        finally:
+            speaker.stop()
+            speaker.close()
+
+
+def _print_latency_summary(turn_latencies: list) -> None:
+    if not turn_latencies:
+        return
+    print(f"\n{'═' * 55}")
+    print(f"  SESSION RETRIEVAL SUMMARY  ({len(turn_latencies)} RAG calls)")
+    print(f"{'═' * 55}")
+    print(f"  {'Turn':<6} {'Embed':>8} {'Cache':>8} {'Source':>10} {'Total':>8}")
+    print(f"  {'─'*6} {'─'*8} {'─'*8} {'─'*10} {'─'*8}")
+    for t in turn_latencies:
+        flag = "⚡" if t["cache"] == "FAISS" else "  "
+        print(
+            f"  {t['turn']:<6} "
+            f"{t['embed_sec']:>7.2f}s "
+            f"{t['cache_sec']*1000:>6.0f}ms "
+            f"{flag}{t['cache']:>8} "
+            f"{t['retrieval_sec']:>7.2f}s"
+        )
+    hits = sum(1 for t in turn_latencies if t["cache"] == "FAISS")
+    avg  = sum(t["retrieval_sec"] for t in turn_latencies) / len(turn_latencies)
+    print(f"  {'─'*55}")
+    print(f"  Avg retrieval : {avg:.2f}s")
+    print(f"  Cache hit rate: {hits}/{len(turn_latencies)} "
+          f"({100*hits//len(turn_latencies) if turn_latencies else 0}%)")
+    print(f"{'═' * 55}\n")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_agent())
+    run_agent()
