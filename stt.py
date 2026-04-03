@@ -32,41 +32,22 @@ SAMPLE_RATE = 16000
 
 def _transcribe_deepgram_streaming(audio: np.ndarray) -> Tuple[str, float]:
     """
-    Uses Deepgram's streaming/live transcription via WebSocket.
-    Sends the recorded audio as a single stream burst — still gives you
-    the streaming path (word-level timestamps, endpointing) vs batch.
+    Uses Deepgram's streaming/live transcription via WebSocket (v6.x SDK).
+    Sends the recorded audio as a single stream burst.
     """
-    import asyncio
-    from deepgram import (
-        DeepgramClient, LiveTranscriptionEvents,
-        LiveOptions, DeepgramClientOptions,
-    )
+    from deepgram import DeepgramClient
 
+    start = time.time()
     transcript_parts = []
-    done_event = asyncio.Event()
 
-    async def _run():
-        config = DeepgramClientOptions(options={"keepalive": "true"})
-        dg = DeepgramClient(api_key=DEEPGRAM_API_KEY, config=config)
-        conn = dg.listen.asynclive.v("1")
+    try:
+        dg = DeepgramClient(api_key=DEEPGRAM_API_KEY)
 
-        def on_message(self, result, **kwargs):
-            alt = result.channel.alternatives[0]
-            if alt.transcript and result.is_final:
-                transcript_parts.append(alt.transcript)
+        # Convert audio to PCM bytes (linear16)
+        pcm = (audio * 32767).astype(np.int16).tobytes()
 
-        def on_close(self, close, **kwargs):
-            done_event.set()
-
-        def on_error(self, error, **kwargs):
-            log.error(f"[Deepgram streaming] {error}")
-            done_event.set()
-
-        conn.on(LiveTranscriptionEvents.Transcript, on_message)
-        conn.on(LiveTranscriptionEvents.Close,      on_close)
-        conn.on(LiveTranscriptionEvents.Error,      on_error)
-
-        opts = LiveOptions(
+        # Use the synchronous context manager API (v6.x)
+        with dg.listen.v1.connect(
             model=DEEPGRAM_STT_MODEL,
             language="en",
             smart_format=True,
@@ -74,26 +55,26 @@ def _transcribe_deepgram_streaming(audio: np.ndarray) -> Tuple[str, float]:
             encoding="linear16",
             sample_rate=SAMPLE_RATE,
             channels=1,
-        )
-        await conn.start(opts)
+        ) as socket_client:
+            # Send all audio at once and finish
+            socket_client.send(pcm)
+            socket_client.finish()
 
-        # Send audio in 100ms chunks (simulates real streaming)
-        chunk_size = int(SAMPLE_RATE * 0.1)
-        pcm = (audio * 32767).astype(np.int16).tobytes()
-        for i in range(0, len(pcm), chunk_size * 2):  # *2 because int16=2 bytes
-            await conn.send(pcm[i : i + chunk_size * 2])
-            await asyncio.sleep(0.01)
+            # Collect results from the streaming response
+            for message in socket_client.listen():
+                try:
+                    if hasattr(message, 'channel') and message.channel:
+                        if hasattr(message.channel, 'alternatives') and message.channel.alternatives:
+                            alt = message.channel.alternatives[0]
+                            if hasattr(alt, 'transcript') and alt.transcript:
+                                if hasattr(message, 'is_final') and message.is_final:
+                                    transcript_parts.append(alt.transcript)
+                except (AttributeError, IndexError, TypeError) as e:
+                    log.debug(f"[Deepgram streaming] Parse error: {e}")
 
-        await conn.finish()
-        # Wait for close event (max 3s)
-        try:
-            await asyncio.wait_for(done_event.wait(), timeout=3.0)
-        except asyncio.TimeoutError:
-            pass
-
-    start = time.time()
-    try:
-        asyncio.run(_run())
+    except ImportError as e:
+        log.error(f"[Deepgram import] {e} — Install with: pip install deepgram-sdk")
+        return "", time.time() - start
     except Exception as e:
         log.error(f"[Deepgram streaming] Failed: {e}")
         return "", time.time() - start

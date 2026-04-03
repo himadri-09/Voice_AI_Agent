@@ -29,3 +29,7 @@ openai>=1.30.0   # already present
 # ElevenLabs
 elevenlabs>=1.0.0
 httpx>=0.27.0
+
+faiss-cpu
+
+pydub>=0.25.1

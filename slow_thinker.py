@@ -1,17 +1,14 @@
 """
 slow_thinker.py — Background prefetch worker.
 
-After every voice turn:
-  1. Takes the last user query + assistant answer
-  2. Asks a cheap LLM call: "What are the 3 most likely follow-up questions?"
-  3. Embeds each predicted question
-  4. Searches Pinecone for matching child chunks
-  5. Stores results in Redis prefetch cache (TTL=2min)
+Changes:
+  1. Guard: skips entirely if query < 3 words (noise turns like "." or "")
+     Before: burned 1 LLM + 3 embed + 3 Pinecone calls on garbage input
+     After:  logs one line and returns immediately
 
-On the next turn, agent.py checks prefetch cache first — if the user
-asks a predicted follow-up, retrieval is instant (no Pinecone call).
-
-This runs as an asyncio background task — it never blocks the voice response.
+  2. Fixed log message:
+     Before: "15/3 topics prefetched"  ← made no sense (15 chunks / 3 topics)
+     After:  "3/3 topics cached (15 chunks total)"  ← clear
 """
 
 import asyncio
@@ -20,7 +17,7 @@ import logging
 import re
 from typing import List, Dict
 
-import redis
+import numpy as np
 from openai import AzureOpenAI
 from pinecone import Pinecone
 
@@ -31,9 +28,11 @@ from config import (
     PINECONE_API_KEY, PINECONE_INDEX_NAME,
     SLOW_THINKER_N, TOP_K_CHILDREN,
 )
-from redis_client import prefetch_set
+from semantic_cache import SemanticCache
 
 log = logging.getLogger(__name__)
+
+MIN_QUERY_WORDS = 3
 
 
 def _get_oai() -> AzureOpenAI:
@@ -53,10 +52,6 @@ async def _predict_followups(
     answer: str,
     n: int,
 ) -> List[str]:
-    """
-    Ask LLM to predict the N most likely follow-up questions.
-    Uses a short prompt with low max_tokens to keep this cheap and fast.
-    """
     prompt = (
         f"A user asked: \"{query}\"\n"
         f"The assistant answered: \"{answer[:300]}\"\n\n"
@@ -79,30 +74,32 @@ async def _predict_followups(
         match = re.search(r'\[.*?\]', text, re.DOTALL)
         if match:
             questions = json.loads(match.group())
-            log.info(f"[SlowThinker] Predicted {len(questions)} follow-ups")
+            log.info(f"[SlowThinker] Predicted: {questions}")
             return questions[:n]
     except Exception as e:
-        log.warning(f"[SlowThinker] Follow-up prediction failed: {e}")
+        log.warning(f"[SlowThinker] Prediction failed: {e}")
     return []
 
 
-async def _embed_and_search(
+async def _embed_search_and_cache(
     oai: AzureOpenAI,
     pc_index,
+    cache: SemanticCache,
     question: str,
-) -> List[Dict]:
-    """Embed one question and search Pinecone for child chunks."""
+) -> int:
+    """Returns number of chunks cached (0 on failure)."""
     try:
-        response = await asyncio.to_thread(
+        emb_resp = await asyncio.to_thread(
             oai.embeddings.create,
             model=AZURE_EMBEDDING_DEPLOYMENT_NAME,
             input=question,
         )
-        vector = response.data[0].embedding
+        query_vector = emb_resp.data[0].embedding
+        query_np     = np.array(query_vector, dtype=np.float32)
 
         result = await asyncio.to_thread(
             pc_index.query,
-            vector=vector,
+            vector=query_vector,
             top_k=TOP_K_CHILDREN,
             include_metadata=True,
             filter={"type": {"$eq": "child"}},
@@ -110,58 +107,78 @@ async def _embed_and_search(
 
         chunks = []
         for match in result.get("matches", []):
-            meta = match.get("metadata", {})
+            meta  = match.get("metadata", {})
+            score = round(match.get("score", 0), 3)
             chunks.append({
-                "content":       meta.get("content", ""),
-                "url":           meta.get("url", ""),
-                "title":         meta.get("title", ""),
-                "section_title": meta.get("section_title", ""),
-                "heading_path":  meta.get("heading_path", ""),
-                "parent_id":     meta.get("parent_id", ""),
-                "score":         round(match.get("score", 0), 3),
+                "content":        meta.get("content", ""),
+                "parent_content": "",
+                "url":            meta.get("url", ""),
+                "title":          meta.get("title", ""),
+                "section_title":  meta.get("section_title", ""),
+                "heading_path":   meta.get("heading_path", ""),
+                "score":          score,
             })
-        return chunks
+
+        if not chunks:
+            return 0
+
+        cache.put(
+            doc_embedding=query_np,
+            chunks=chunks,
+            relevance_score=chunks[0]["score"],
+        )
+        log.info(f"[SlowThinker] Cached {len(chunks)} chunks → \"{question[:50]}\"")
+        return len(chunks)
 
     except Exception as e:
-        log.warning(f"[SlowThinker] Search failed for '{question[:40]}': {e}")
-        return []
+        log.warning(f"[SlowThinker] Failed for '{question[:40]}': {e}")
+        return 0
 
 
 async def run_slow_thinker(
-    r: redis.Redis,
-    call_id: str,
+    cache: SemanticCache,
     last_query: str,
     last_answer: str,
 ) -> None:
     """
-    Main slow thinker coroutine — called as asyncio.create_task() from agent.py.
-    Runs entirely in background, never awaited by the main voice loop.
+    Fired with asyncio.create_task() — never awaited by the main loop.
+
+    Guard: returns immediately if query is too short.
+    This prevents wasting API calls on noise turns (".", "", one word).
     """
-    log.info(f"[SlowThinker] Starting for call={call_id}")
+    # ── Guard ──────────────────────────────────────────────────────────────────
+    if len(last_query.split()) < MIN_QUERY_WORDS:
+        log.info(f"[SlowThinker] Skipped — '{last_query}' is too short")
+        return
+
+    log.info(f"[SlowThinker] Starting for: \"{last_query[:55]}\"")
+    t0 = __import__("time").time()
 
     try:
         oai      = _get_oai()
         pc_index = _get_pinecone_index()
 
-        # 1. Predict follow-up questions
         followups = await _predict_followups(oai, last_query, last_answer, SLOW_THINKER_N)
         if not followups:
-            log.info("[SlowThinker] No follow-ups predicted — exiting")
+            log.info("[SlowThinker] No follow-ups — exiting")
             return
 
-        # 2. For each follow-up: embed + search + cache
-        tasks = [_embed_and_search(oai, pc_index, q) for q in followups]
+        tasks   = [_embed_search_and_cache(oai, pc_index, cache, q) for q in followups]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        stored = 0
-        for question, chunks in zip(followups, results):
-            if isinstance(chunks, Exception) or not chunks:
-                continue
-            await asyncio.to_thread(prefetch_set, r, call_id, question, chunks)
-            log.info(f"[SlowThinker] Prefetched {len(chunks)} chunks for: {question[:50]}")
-            stored += 1
+        # ── Fixed log ──────────────────────────────────────────────────────────
+        # Before: "15/3 topics prefetched"  (stored = total chunks, not topics)
+        # After:  "3/3 topics cached (15 chunks total)"
+        chunks_per_topic = [r for r in results if isinstance(r, int) and r > 0]
+        topics_ok        = len(chunks_per_topic)
+        total_chunks     = sum(chunks_per_topic)
+        elapsed          = __import__("time").time() - t0
 
-        log.info(f"[SlowThinker] Done — {stored}/{len(followups)} topics prefetched")
+        log.info(
+            f"[SlowThinker] Done — {topics_ok}/{len(followups)} topics cached "
+            f"({total_chunks} chunks total) in {elapsed:.2f}s | "
+            f"cache size: {cache.size}"
+        )
 
     except Exception as e:
-        log.error(f"[SlowThinker] Unexpected error: {e}")
+        log.error(f"[SlowThinker] Error: {e}")

@@ -1,68 +1,67 @@
 """
-agent.py — Voice AI agent: Deepgram STT → Redis → Pinecone → LLM → Deepgram TTS.
+agent.py — Voice AI agent: STT → SemanticCache (FAISS) → Pinecone → LLM → TTS.
 
-Retrieval priority per turn:
-  1. Redis prefetch cache  (slow thinker pre-warmed — instant)
-  2. Redis semantic cache  (same/similar query asked before — instant)
-  3. Pinecone child search (fresh retrieval — ~300ms)
-     → for each child hit, attach parent content for full context
-
-After every turn, slow_thinker runs as a background task to prefetch
-likely follow-up chunks into Redis.
-
-Press Ctrl+C to exit.
+Changes in this version:
+  1. Slow thinker guard — skipped if query < 3 words (noise/empty turns)
+  2. Clean per-turn log showing the metric that matters:
+       Query→Answer = retrieval + generation (what user feels as agent delay)
+  3. Suppressed noisy INFO logs from Azure HTTP / SemanticCache internals
+     — only WARNINGS and above from third-party libraries are shown
 """
 
 import asyncio
-import io
 import logging
-import os
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
-import redis
 import sounddevice as sd
-import soundfile as sf
-from stt import transcribe
-from tts import speak
 from openai import AzureOpenAI
 from pinecone import Pinecone
+from stt import transcribe
+from tts import speak
 
 from config import (
     AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT,
     AZURE_API_VERSION, AZURE_DEPLOYMENT_NAME,
     AZURE_EMBEDDING_DEPLOYMENT_NAME,
-    DEEPGRAM_API_KEY, DEEPGRAM_STT_MODEL, DEEPGRAM_TTS_MODEL,
     PINECONE_API_KEY, PINECONE_INDEX_NAME,
     TOP_K_CHILDREN,
 )
 from redis_client import (
     get_redis_client, redis_ping,
     session_add_turn, session_get_history,
-    session_save_chunks, session_get_last_chunks,
-    semantic_get, semantic_set,
-    prefetch_get, prefetch_clear_call,
+    session_save_chunks,
 )
+from semantic_cache import SemanticCache
 from slow_thinker import run_slow_thinker
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+# ── Logging: suppress noisy HTTP / cache internals, keep our prints clean ─────
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)   # our own logger stays verbose
+# Silence Azure SDK and httpx HTTP request lines
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("pinecone").setLevel(logging.WARNING)
 
-# ── Audio settings ────────────────────────────────────────────────────────────
+# ── Audio settings ─────────────────────────────────────────────────────────────
 SAMPLE_RATE       = 16000
 CHANNELS          = 1
 SILENCE_THRESHOLD = 0.01
-SILENCE_DURATION  = 2    # seconds of silence to stop recording
+SILENCE_DURATION  = 2
 MAX_RECORD_SEC    = 30
+
+EMBEDDING_DIM = 1536   # text-embedding-ada-002 / text-embedding-3-small
 
 GREETING = (
     "Hello! I'm your AI assistant. I'm ready to answer your questions about Dyyota "
     "and our services. Just speak after the beep and I'll help you."
 )
-
-EXIT_PHRASES = {"exit","quit","bye","goodbye","stop","that's all","end call"}
+EXIT_PHRASES = {"exit", "quit", "bye", "goodbye", "stop", "that's all", "end call"}
+MIN_QUERY_WORDS = 3   # below this — skip slow thinker, it's noise
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -81,27 +80,27 @@ def _pc_index():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STT
+# AUDIO
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _beep():
     try:
         t    = np.linspace(0, 0.15, int(SAMPLE_RATE * 0.15), False)
         tone = (0.3 * np.sin(2 * np.pi * 880 * t)).astype(np.float32)
-        sd.play(tone, SAMPLE_RATE); sd.wait()
+        sd.play(tone, SAMPLE_RATE)
+        sd.wait()
     except Exception:
         pass
 
 def record_until_silence() -> Tuple[np.ndarray, float]:
-    """Record audio until silence detected. Returns (audio, duration_sec)."""
     print("🎤 Listening...")
     start_time = time.time()
     _beep()
-    frames        = []
-    silent        = 0
-    chunk_size    = int(SAMPLE_RATE * 0.1)
-    need_silent   = int(SILENCE_DURATION / 0.1)
-    max_chunks    = int(MAX_RECORD_SEC / 0.1)
+    frames      = []
+    silent      = 0
+    chunk_size  = int(SAMPLE_RATE * 0.1)
+    need_silent = int(SILENCE_DURATION / 0.1)
+    max_chunks  = int(MAX_RECORD_SEC / 0.1)
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
                         dtype="float32", blocksize=chunk_size) as stream:
@@ -113,56 +112,54 @@ def record_until_silence() -> Tuple[np.ndarray, float]:
             if silent >= need_silent and len(frames) > 10:
                 break
 
-    audio = np.concatenate(frames, axis=0)
+    audio    = np.concatenate(frames, axis=0)
     duration = len(audio) / SAMPLE_RATE
-    print(f"🎤 Recorded {duration:.1f}s")
     return audio, duration
 
+
 # ═════════════════════════════════════════════════════════════════════════════
-# RETRIEVAL  — prefetch → semantic cache → Pinecone children → parent context
+# RETRIEVAL
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _embed_query(oai: AzureOpenAI, query: str) -> List[float]:
+def _embed_query(oai: AzureOpenAI, query: str) -> np.ndarray:
     resp = oai.embeddings.create(
-        model=AZURE_EMBEDDING_DEPLOYMENT_NAME, input=query)
-    return resp.data[0].embedding
+        model=AZURE_EMBEDDING_DEPLOYMENT_NAME,
+        input=query,
+    )
+    return np.array(resp.data[0].embedding, dtype=np.float32)
 
-def _search_pinecone(pc_index, vector: List[float]) -> Tuple[List[Dict], float]:
-    """Search child chunks, then fetch parent content. Returns (chunks, latency_sec)."""
-    start_time = time.time()
+
+def _search_pinecone(pc_index, vector: np.ndarray) -> Tuple[List[Dict], float]:
+    start = time.time()
     result = pc_index.query(
-        vector=vector,
+        vector=vector.tolist(),
         top_k=TOP_K_CHILDREN,
         include_metadata=True,
         filter={"type": {"$eq": "child"}},
     )
 
     chunks = []
-    fetched_parents = {}
+    fetched_parents: Dict[str, str] = {}
 
     for match in result.get("matches", []):
         meta      = match.get("metadata", {})
         parent_id = meta.get("parent_id", "")
         score     = round(match.get("score", 0), 3)
 
-        # Fetch parent content (once per unique parent_id)
         parent_content = ""
         if parent_id:
             if parent_id not in fetched_parents:
                 try:
                     fetch_resp = pc_index.fetch(ids=[parent_id])
-                    pv         = fetch_resp.get("vectors", {}).get(parent_id)
-                    if pv:
-                        fetched_parents[parent_id] = pv["metadata"].get("content","")
-                    else:
-                        fetched_parents[parent_id] = ""
+                    pv = fetch_resp.get("vectors", {}).get(parent_id)
+                    fetched_parents[parent_id] = pv["metadata"].get("content", "") if pv else ""
                 except Exception:
                     fetched_parents[parent_id] = ""
             parent_content = fetched_parents[parent_id]
 
         chunks.append({
-            "content":        meta.get("content", ""),      # child section
-            "parent_content": parent_content,               # full page
+            "content":        meta.get("content", ""),
+            "parent_content": parent_content,
             "url":            meta.get("url", ""),
             "title":          meta.get("title", ""),
             "section_title":  meta.get("section_title", ""),
@@ -170,43 +167,30 @@ def _search_pinecone(pc_index, vector: List[float]) -> Tuple[List[Dict], float]:
             "score":          score,
         })
 
-    latency = time.time() - start_time
-    print(f"📚 Retrieved {len(chunks)} chunks | top score: {chunks[0]['score'] if chunks else 0} | latency: {latency:.2f}s")
-    return chunks, latency
+    return chunks, time.time() - start
+
 
 def retrieve(
-    r: redis.Redis,
     oai: AzureOpenAI,
     pc_index,
-    call_id: str,
+    cache: SemanticCache,
     query: str,
 ) -> Tuple[List[Dict], str, float]:
-    """
-    Returns (chunks, cache_source, latency_sec) where cache_source is one of:
-      "prefetch" | "semantic" | "pinecone"
-    """
-    start_time = time.time()
+    start = time.time()
+    query_vec = _embed_query(oai, query)
 
-    # 1. Prefetch cache (slow thinker pre-warmed)
-    prefetched = prefetch_get(r, call_id, query)
-    if prefetched:
-        latency = time.time() - start_time
-        print(f"⚡ Cache: PREFETCH HIT | latency: {latency:.3f}s")
-        return prefetched, "prefetch", latency
+    # 1. FAISS semantic cache
+    cached_chunks = cache.get(query_vec)
+    if cached_chunks:
+        latency = time.time() - start
+        return cached_chunks, "cache", latency
 
-    # 2. Semantic cache (same query answered recently)
-    cached = semantic_get(r, query)
-    if cached:
-        latency = time.time() - start_time
-        print(f"⚡ Cache: SEMANTIC HIT | latency: {latency:.3f}s")
-        return cached.get("chunks", []), "semantic", latency
+    # 2. Pinecone
+    chunks, _ = _search_pinecone(pc_index, query_vec)
+    if chunks:
+        cache.put(doc_embedding=query_vec, chunks=chunks, relevance_score=chunks[0]["score"])
 
-    # 3. Fresh Pinecone retrieval
-    print(f"🔍 Cache: MISS → querying Pinecone")
-    vector = _embed_query(oai, query)
-    chunks, pc_latency = _search_pinecone(pc_index, vector)
-    latency = time.time() - start_time
-    return chunks, "pinecone", latency
+    return chunks, "pinecone", time.time() - start
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -219,36 +203,27 @@ def generate_answer(
     chunks: List[Dict],
     history: List[Dict],
 ) -> Tuple[str, float]:
-    """Generate answer from LLM. Returns (answer, latency_sec)."""
-    start_time = time.time()
-    
-    if not chunks:
-        latency = time.time() - start_time
-        return "I'm sorry, I couldn't find relevant information to answer that.", latency
+    start = time.time()
 
-    # Use parent_content when available (full page context), else child content
+    if not chunks:
+        return "I'm sorry, I couldn't find relevant information to answer that.", 0.0
+
     context_parts = []
     for i, c in enumerate(chunks):
         body = c.get("parent_content") or c.get("content", "")
-        context_parts.append(
-            f"[{i+1}] {c['heading_path'] or c['title']}\n{body[:3000]}"
-        )
+        context_parts.append(f"[{i+1}] {c['heading_path'] or c['title']}\n{body[:3000]}")
     context = "\n\n---\n\n".join(context_parts)
 
     system = (
-        "You are a helpful voice assistant for an AI service provider named 'Dyyota'. "
-        "Answer the user's question based only on the provided documentation. "
-        "Be concise — your answer will be spoken aloud, so keep it to 2-3 sentences max. "
+        "You are a helpful voice assistant for Dyyota. "
+        "Answer in 2-3 short sentences max — your answer will be spoken aloud. "
         "Use plain conversational English. No markdown, no bullet points, no code blocks. "
-        "If the documentation doesn't contain the answer, say so clearly and briefly."
+        "If the documentation doesn't contain the answer, say so briefly."
     )
 
     messages = [{"role": "system", "content": system}]
-
-    # Include recent conversation history for follow-up context
     if history:
         messages.extend(history[-6:])
-
     messages.append({
         "role": "user",
         "content": f"Documentation:\n{context}\n\nQuestion: {query}",
@@ -262,120 +237,129 @@ def generate_answer(
             max_tokens=180,
         )
         answer = resp.choices[0].message.content.strip()
-        latency = time.time() - start_time
-        print(f"💬 Answer: {answer}")
-        return answer, latency
+        return answer, time.time() - start
     except Exception as e:
-        latency = time.time() - start_time
         log.error(f"Generation error: {e}")
-        return "I encountered an error. Please try again.", latency
+        return "I encountered an error. Please try again.", time.time() - start
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MAIN AGENT LOOP
+# MAIN LOOP
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_agent():
-    print("\n" + "="*55)
-    print("🎙️  VOICE RAG AGENT ")
-    print("="*55)
+async def run_agent():
+    print("\n" + "=" * 55)
+    print("🎙️  VOICE RAG AGENT")
+    print("=" * 55)
 
-    # ── Init clients ──────────────────────────────────────────────────────────
     oai      = _oai()
     pc_index = _pc_index()
     r        = get_redis_client()
 
-    # ── Health checks ─────────────────────────────────────────────────────────
     if not redis_ping(r):
-        print("❌ Redis connection failed. Check REDIS_HOST / REDIS_PASSWORD in .env")
+        print("❌ Redis connection failed.")
         return
 
     stats = pc_index.describe_index_stats()
-    total = stats.get("total_vector_count", 0)
-    if total == 0:
-        print("⚠️  Pinecone index is empty — run: python ingest.py --url <your-site>")
+    if stats.get("total_vector_count", 0) == 0:
+        print("⚠️  Pinecone index empty — run: python ingest.py --url <your-site>")
         return
 
-    print(f"✅ Redis connected")
-    print(f"✅ Pinecone ready — {total} vectors")
-    print(f"\n🚀 Starting. Say 'exit' or 'goodbye' to end.\n")
+    cache = SemanticCache(
+        dimension=EMBEDDING_DIM,
+        max_size=500,
+        default_ttl=120.0,
+        similarity_threshold=0.40,
+    )
 
-    # ── Unique call ID for session isolation ──────────────────────────────────
+    print(f"✅ Pinecone ready — {stats['total_vector_count']} vectors")
+    print(f"✅ SemanticCache ready\n")
+
     call_id = str(uuid.uuid4())[:8]
-    print(f"📞 Call ID: {call_id}")
+    print(f"📞 Call ID: {call_id}\n")
 
-    # ── Greet ─────────────────────────────────────────────────────────────────
-    _ = speak(GREETING)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, speak, GREETING)
 
-    # ── Conversation loop ─────────────────────────────────────────────────────
     turn = 0
     while True:
         turn += 1
-        turn_start = time.time()
-        print(f"\n{'─'*40}  Turn {turn}")
+        print(f"\n{'─' * 48}  Turn {turn}")
 
         try:
-            # 1. Record + transcribe
-            audio, record_latency = record_until_silence()
-            query, stt_latency = transcribe(audio)
-            print(f"  ⏱️  Record: {record_latency:.2f}s | STT: {stt_latency:.2f}s")
+            # ── 1. Record ─────────────────────────────────────────────────────
+            audio, record_sec = await loop.run_in_executor(None, record_until_silence)
 
-            if not query:
-                _ = speak("I didn't catch that. Could you please repeat?")
+            # ── 2. STT ────────────────────────────────────────────────────────
+            query, stt_sec = await loop.run_in_executor(None, transcribe, audio)
+
+            # STT done = user's turn is over, agent processing starts now
+            agent_start = time.time()
+
+            print(f"🎤  You said: \"{query}\"")
+            print(f"    Record {record_sec:.1f}s  |  STT {stt_sec:.2f}s")
+
+            if not query.strip():
+                await loop.run_in_executor(None, speak, "I didn't catch that. Could you repeat?")
                 continue
 
-            # 2. Exit check
             if any(e in query.lower() for e in EXIT_PHRASES):
-                prefetch_clear_call(r, call_id)
-                _ = speak("Goodbye! Have a great day.")
+                cache.clear()
+                await loop.run_in_executor(None, speak, "Goodbye! Have a great day.")
                 print("\n👋 Exiting.")
                 break
 
-            # 3. Retrieve (prefetch → semantic → Pinecone)
-            chunks, cache_source, retrieval_latency = retrieve(r, oai, pc_index, call_id, query)
+            # ── 3. Retrieve ───────────────────────────────────────────────────
+            chunks, cache_source, retrieval_sec = await loop.run_in_executor(
+                None, retrieve, oai, pc_index, cache, query
+            )
+            cache_label = f"FAISS hit" if cache_source == "cache" else "Pinecone"
 
-            # 4. Get conversation history for context
-            history = session_get_history(r, call_id)
+            # ── 4. Generate ───────────────────────────────────────────────────
+            history          = session_get_history(r, call_id)
+            answer, gen_sec  = await loop.run_in_executor(
+                None, generate_answer, oai, query, chunks, history
+            )
 
-            # 5. Generate answer
-            answer, gen_latency = generate_answer(oai, query, chunks, history)
-            print(f"  ⏱️  Retrieval: {retrieval_latency:.2f}s | Generation: {gen_latency:.2f}s")
+            # This is the moment the agent has the answer — before TTS API call
+            query_to_answer_sec = time.time() - agent_start
 
-            # 6. Cache result in semantic cache (only for fresh Pinecone hits)
-            if cache_source == "pinecone" and chunks:
-                semantic_set(r, query, chunks, answer)
+            print(f"💬  \"{answer}\"")
+            print(f"    Retrieval {retrieval_sec:.2f}s ({cache_label})  |  "
+                  f"LLM {gen_sec:.2f}s")
+            print(f"    ⚡ Query→Answer: {query_to_answer_sec:.2f}s  "
+                  f"← time from your last word to agent having the answer")
 
-            # 7. Save turn to session history + last chunks
+            # ── 5. Save session ───────────────────────────────────────────────
             session_add_turn(r, call_id, "user", query)
             session_add_turn(r, call_id, "assistant", answer)
             session_save_chunks(r, call_id, chunks)
 
-            # 8. Speak answer
-            tts_latency = speak(answer)
-            print(f"  ⏱️  TTS: {tts_latency:.2f}s")
+            # ── 6. Speak ──────────────────────────────────────────────────────
+            print("🔊  Speaking...")
+            tts_sec = await loop.run_in_executor(None, speak, answer)
+            print(f"    TTS {tts_sec:.2f}s  (audio playback included)")
 
-            # 9. Total turn time (user spoke → agent spoke)
-            total_turn_time = time.time() - turn_start
-            print(f"  ⏱️  Total Turn Time: {total_turn_time:.2f}s")
+            # ── 7. Summary ────────────────────────────────────────────────────
+            print(f"    Cache entries: {cache.size}")
 
-            # 10. Fire slow thinker in background (non-blocking)
-            asyncio.get_event_loop().run_until_complete(
-                asyncio.ensure_future(
-                    run_slow_thinker(r, call_id, query, answer)
-                )
-            )
+            # ── 8. Slow thinker — fire only for real queries ──────────────────
+            if len(query.split()) >= MIN_QUERY_WORDS:
+                asyncio.create_task(run_slow_thinker(cache, query, answer))
+            else:
+                log.info(f"[SlowThinker] Skipped — query too short: '{query}'")
 
         except KeyboardInterrupt:
-            prefetch_clear_call(r, call_id)
-            print("\n\n👋 Interrupted. Exiting.")
+            cache.clear()
+            print("\n\n👋 Interrupted.")
             break
         except Exception as e:
-            log.error(f"Turn error: {e}")
+            log.error(f"Turn error: {e}", exc_info=True)
             try:
-                _ = speak("I encountered an error. Please try again.")
+                await loop.run_in_executor(None, speak, "I encountered an error. Please try again.")
             except Exception:
                 pass
 
 
 if __name__ == "__main__":
-    run_agent()
+    asyncio.run(run_agent())
