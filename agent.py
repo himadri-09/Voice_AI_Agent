@@ -25,7 +25,8 @@ import numpy as np
 import redis
 import sounddevice as sd
 import soundfile as sf
-from deepgram import DeepgramClient
+from stt import transcribe
+from tts import speak
 from openai import AzureOpenAI
 from pinecone import Pinecone
 
@@ -78,9 +79,6 @@ def _oai() -> AzureOpenAI:
 def _pc_index():
     return Pinecone(api_key=PINECONE_API_KEY).Index(PINECONE_INDEX_NAME)
 
-def _dg() -> DeepgramClient:
-    return DeepgramClient(api_key=DEEPGRAM_API_KEY)
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # STT
@@ -119,30 +117,6 @@ def record_until_silence() -> Tuple[np.ndarray, float]:
     duration = len(audio) / SAMPLE_RATE
     print(f"🎤 Recorded {duration:.1f}s")
     return audio, duration
-
-def transcribe(dg: DeepgramClient, audio: np.ndarray) -> Tuple[str, float]:
-    """Transcribe audio using Deepgram STT. Returns (transcript, latency_sec)."""
-    start_time = time.time()
-    buf = io.BytesIO()
-    sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
-    buf.seek(0)
-    try:
-        resp = dg.listen.v1.media.transcribe_file(
-            request=buf.read(),
-            model=DEEPGRAM_STT_MODEL,
-            language="en",
-            smart_format=True,
-            punctuate=True,
-        )
-        transcript = resp.results.channels[0].alternatives[0].transcript
-        latency = time.time() - start_time
-        print(f"📝 You said: {transcript!r}")
-        return transcript.strip(), latency
-    except Exception as e:
-        latency = time.time() - start_time
-        log.error(f"STT error: {e}")
-        return "", latency
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # RETRIEVAL  — prefetch → semantic cache → Pinecone children → parent context
@@ -298,44 +272,6 @@ def generate_answer(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TTS
-# ═════════════════════════════════════════════════════════════════════════════
-
-def speak(dg: DeepgramClient, text: str) -> float:
-    """Speak text using Deepgram TTS. Returns latency_sec."""
-    start_time = time.time()
-    print("🔊 Speaking...")
-    try:
-        audio_stream = dg.speak.v1.audio.generate(
-            text=text,
-            model=DEEPGRAM_TTS_MODEL,
-        )
-        # Collect the audio bytes from the iterator
-        audio_bytes = b"".join(audio_stream)
-        
-        # Write to temporary file
-        with open("_tts.mp3", "wb") as f:
-            f.write(audio_bytes)
-        
-        # Play the audio
-        data, sr = sf.read("_tts.mp3")
-        sd.play(data, sr)
-        sd.wait()
-        latency = time.time() - start_time
-        return latency
-    except Exception as e:
-        latency = time.time() - start_time
-        log.error(f"TTS error: {e}")
-        print(f"[TTS fallback] {text}")
-        return latency
-    finally:
-        try:
-            os.remove("_tts.mp3")
-        except Exception:
-            pass
-
-
-# ═════════════════════════════════════════════════════════════════════════════
 # MAIN AGENT LOOP
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -347,7 +283,6 @@ def run_agent():
     # ── Init clients ──────────────────────────────────────────────────────────
     oai      = _oai()
     pc_index = _pc_index()
-    dg       = _dg()
     r        = get_redis_client()
 
     # ── Health checks ─────────────────────────────────────────────────────────
@@ -370,7 +305,7 @@ def run_agent():
     print(f"📞 Call ID: {call_id}")
 
     # ── Greet ─────────────────────────────────────────────────────────────────
-    _ = speak(dg, GREETING)
+    _ = speak(GREETING)
 
     # ── Conversation loop ─────────────────────────────────────────────────────
     turn = 0
@@ -382,17 +317,17 @@ def run_agent():
         try:
             # 1. Record + transcribe
             audio, record_latency = record_until_silence()
-            query, stt_latency = transcribe(dg, audio)
+            query, stt_latency = transcribe(audio)
             print(f"  ⏱️  Record: {record_latency:.2f}s | STT: {stt_latency:.2f}s")
 
             if not query:
-                _ = speak(dg, "I didn't catch that. Could you please repeat?")
+                _ = speak("I didn't catch that. Could you please repeat?")
                 continue
 
             # 2. Exit check
             if any(e in query.lower() for e in EXIT_PHRASES):
                 prefetch_clear_call(r, call_id)
-                _ = speak(dg, "Goodbye! Have a great day.")
+                _ = speak("Goodbye! Have a great day.")
                 print("\n👋 Exiting.")
                 break
 
@@ -416,7 +351,7 @@ def run_agent():
             session_save_chunks(r, call_id, chunks)
 
             # 8. Speak answer
-            tts_latency = speak(dg, answer)
+            tts_latency = speak(answer)
             print(f"  ⏱️  TTS: {tts_latency:.2f}s")
 
             # 9. Total turn time (user spoke → agent spoke)
@@ -437,7 +372,7 @@ def run_agent():
         except Exception as e:
             log.error(f"Turn error: {e}")
             try:
-                _ = speak(dg, "I encountered an error. Please try again.")
+                _ = speak("I encountered an error. Please try again.")
             except Exception:
                 pass
 

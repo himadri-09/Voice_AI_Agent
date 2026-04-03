@@ -52,3 +52,22 @@ SLOW_THINKER_N                  = int(os.getenv("SLOW_THINKER_N",  "3"))     # f
 # ── Local storage ─────────────────────────────────────────────────────────────
 PAGES_DIR                       = Path("pages")
 PAGES_DIR.mkdir(exist_ok=True)
+
+# ── Provider selection ────────────────────────────────────────────────────────
+STT_PROVIDER = os.getenv("STT_PROVIDER", "deepgram")   # deepgram | openai | elevenlabs
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "deepgram")   # deepgram | openai | elevenlabs
+
+# ── ElevenLabs ────────────────────────────────────────────────────────────────
+ELEVENLABS_API_KEY   = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID  = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel
+ELEVENLABS_MODEL_ID  = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
+
+# ── OpenAI Realtime / Whisper ─────────────────────────────────────────────────
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")       # standard OpenAI (not Azure)
+OPENAI_STT_MODEL     = os.getenv("OPENAI_STT_MODEL", "whisper-1")
+OPENAI_TTS_MODEL     = os.getenv("OPENAI_TTS_MODEL", "tts-1")
+OPENAI_TTS_VOICE     = os.getenv("OPENAI_TTS_VOICE", "alloy")
+
+# ── Deepgram streaming ────────────────────────────────────────────────────────
+DEEPGRAM_STT_MODEL   = "nova-2"
+DEEPGRAM_TTS_MODEL   = "aura-asteria-en"

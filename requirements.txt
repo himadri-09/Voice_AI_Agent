@@ -22,3 +22,10 @@ numpy>=1.24.0
 
 # Utilities
 python-dotenv>=1.0.0
+
+# OpenAI standard (for Whisper + TTS, separate from Azure)
+openai>=1.30.0   # already present
+
+# ElevenLabs
+elevenlabs>=1.0.0
+httpx>=0.27.0
